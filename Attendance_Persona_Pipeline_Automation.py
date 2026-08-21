@@ -5,10 +5,17 @@ Auto-generated cron pipeline — attendance & persona view dashboards
 
 Ported from the DS_batches_data notebook, wrapped for unattended GitHub
 Actions execution:
-  - Auth via env vars / service account instead of Colab's interactive auth.
+  - Auth via a Metabase API key (X-Api-Key header) instead of the old
+    username/password session-login flow — no more ASHRITHA_SECRET_KEY,
+    no login POST, no token refresh step. (This replaces a half-migrated
+    version that still called refresh_metabase_token() and referenced
+    undefined MB_URL/User_name/sec — that would have crashed immediately.)
   - requests.post is patched to use a retry-hardened Session (connection
     resets / 5xx / 429 are retried automatically), matching the fix applied
     to the main Assignment Automation Pipeline for card 9913-style failures.
+  - gc.open()/gc.open_by_key() calls are wrapped so a missing share grant
+    fails with the exact service-account email to add, instead of a bare
+    SpreadsheetNotFound traceback.
   - Any uncaught exception exits non-zero so the GitHub Actions run goes red.
 """
 
@@ -50,6 +57,7 @@ creds = Credentials.from_service_account_info(
 gc = gspread.authorize(creds)
 
 METABASE_BASE = "https://metabase-lierhfgoeiwhr.newtonschool.co"
+METABASE_HOST = METABASE_BASE  # alias — several cells below refer to this name
 
 # -------------------- RETRY-HARDENED SESSION --------------------
 # Same fix as the main Assignment Automation Pipeline: ConnectionError /
@@ -78,28 +86,43 @@ SESSION.mount("http://", _adapter)
 # call site individually.
 requests.post = SESSION.post
 
-token = None
+# Static header used for every Metabase API call — no login step, no
+# token expiry/refresh to worry about.
+METABASE_HEADERS = {
+    "Content-Type": "application/json",
+    "X-Api-Key": METABASE_API_KEY,
+}
 
 
-def refresh_metabase_token():
-    global token
-    res = SESSION.post(
-        MB_URL,
-        headers={"Content-Type": "application/json"},
-        json={"username": User_name, "password": sec},
-        timeout=(15, 60),
-    )
-    res.raise_for_status()
-    token = res.json()["id"]
-    print("✅ Metabase session token refreshed")
+def safe_open_sheet(title):
+    """gc.open() wrapped to fail with an actionable message (the exact
+    service-account email to share the sheet with) instead of a bare
+    SpreadsheetNotFound traceback."""
+    try:
+        return gc.open(title)
+    except gspread.exceptions.SpreadsheetNotFound:
+        raise RuntimeError(
+            f"❌ Could not open Google Sheet '{title}'. Either the title "
+            f"doesn't match exactly, or it hasn't been shared with this "
+            f"service account: {service_info.get('client_email')}. "
+            "Share it as Editor, then re-run."
+        )
 
 
-refresh_metabase_token()
+def safe_open_by_key(key):
+    """Same as safe_open_sheet, but for gc.open_by_key()."""
+    try:
+        return gc.open_by_key(key)
+    except gspread.exceptions.SpreadsheetNotFound:
+        raise RuntimeError(
+            f"❌ Could not open Google Sheet with key '{key}'. Share it with "
+            f"this service account as Editor: {service_info.get('client_email')}"
+        )
+
 
 print("🔎 ENV CHECK")
-print(f"   MB user           : {'[SET]' if User_name else '[MISSING]'}")
-print(f"   SA client_email   : {service_info.get('client_email')}")
-print(f"   Token acquired    : {bool(token)}")
+print(f"   Metabase API key   : {'[SET]' if METABASE_API_KEY else '[MISSING]'}")
+print(f"   SA client_email    : {service_info.get('client_email')}")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PIPELINE BODY (ported from notebook cells: 56-75)
@@ -119,7 +142,6 @@ try:
     # CONFIG
     # =====================================================================
 
-    METABASE_HOST = "https://metabase-lierhfgoeiwhr.newtonschool.co"
     LECTURE_ATTENDANCE_CARD_ID = 11634  # "user-level-lecture-level-attendance"
 
     OUTPUT_SHEET_ID = "10ZBb4jOFuyQE6sBPIqKe9tvi8O1GmJJlaxapy58Y9sQ"  # <-- update if this should target a different sheet
@@ -196,7 +218,7 @@ try:
 
         res = requests.post(
             f"{METABASE_HOST}/api/card/{metabase_card_id}/query/json",
-            headers={"Content-Type": "application/json", "X-Metabase-Session": token},
+            headers=METABASE_HEADERS,
             timeout=3600,
         )
         res.raise_for_status()
@@ -269,7 +291,7 @@ try:
     # ═══════════════════════════════════════════════════════════════════════════
     print("📥 STEP 1: Load Groomers Data")
 
-    workbook_groomers = gc.open("Groomers")
+    workbook_groomers = safe_open_sheet("Groomers")
     worksheet_groomers = workbook_groomers.worksheet("Groomers")
     data_groomers = worksheet_groomers.get_all_values()
 
@@ -292,7 +314,7 @@ try:
     print("\n📥 STEP 2: Load Master Data")
 
     try:
-        workbook_master = gc.open("DS Full program - All Intake 2026")
+        workbook_master = safe_open_sheet("DS Full program - All Intake 2026")
         worksheet_master = workbook_master.worksheet("Master Data 2023-2026")
         data_master = worksheet_master.get_all_values()
 
@@ -330,7 +352,7 @@ try:
     print("UPLOADING TO GOOGLE SHEETS")
     print("=" * 80)
 
-    sheet = gc.open_by_key(OUTPUT_SHEET_ID)
+    sheet = safe_open_by_key(OUTPUT_SHEET_ID)
 
     print(f"\n☁️  Uploading {STUDENT_LEVEL_WORKSHEET}...")
     try:
@@ -357,7 +379,6 @@ try:
     # CONFIG
     # =====================================================================
 
-    METABASE_HOST = "https://metabase-lierhfgoeiwhr.newtonschool.co"
     LECTURE_ATTENDANCE_CARD_ID = 11789  # "user-level-lecture-level-attendance"
 
     OUTPUT_SHEET_ID = "1z72t5HaE3ombCHo6kbpM3bqhnuTEBNR6L8jncdQZ7Y8"  # <-- update if this should target a different sheet
@@ -425,7 +446,7 @@ try:
 
         res = requests.post(
             f"{METABASE_HOST}/api/card/{metabase_card_id}/query/json",
-            headers={"Content-Type": "application/json", "X-Metabase-Session": token},
+            headers=METABASE_HEADERS,
             timeout=3600,
         )
         res.raise_for_status()
@@ -498,7 +519,7 @@ try:
     # ═══════════════════════════════════════════════════════════════════════════
     print("📥 STEP 1: Load Groomers Data")
 
-    workbook_groomers = gc.open("Groomers")
+    workbook_groomers = safe_open_sheet("Groomers")
     worksheet_groomers = workbook_groomers.worksheet("Groomers")
     data_groomers = worksheet_groomers.get_all_values()
 
@@ -521,7 +542,7 @@ try:
     print("\n📥 STEP 2: Load Master Data")
 
     try:
-        workbook_master = gc.open("DS Full program - All Intake 2026")
+        workbook_master = safe_open_sheet("DS Full program - All Intake 2026")
         worksheet_master = workbook_master.worksheet("Master Data 2023-2026")
         data_master = worksheet_master.get_all_values()
 
@@ -559,7 +580,7 @@ try:
     print("UPLOADING TO GOOGLE SHEETS")
     print("=" * 80)
 
-    sheet = gc.open_by_key(OUTPUT_SHEET_ID)
+    sheet = safe_open_by_key(OUTPUT_SHEET_ID)
 
     print(f"\n☁️  Uploading {STUDENT_LEVEL_WORKSHEET}...")
     try:
@@ -585,7 +606,6 @@ try:
     # CONFIG
     # =====================================================================
 
-    METABASE_HOST = "https://metabase-lierhfgoeiwhr.newtonschool.co"
     SESSION_COMPLETION_CARD_ID = 11635  # "user-level-lecture-level-attendance-session-completion-rate"
 
     OUTPUT_SHEET_ID = "1yXKuiV27EmO8KyVHK4Cj54qgFSSbEMPj4m95qVfDWdA"  # <-- update if this should target a different sheet
@@ -663,7 +683,7 @@ try:
 
         res = requests.post(
             f"{METABASE_HOST}/api/card/{metabase_card_id}/query/json",
-            headers={"Content-Type": "application/json", "X-Metabase-Session": token},
+            headers=METABASE_HEADERS,
             timeout=3600,
         )
         res.raise_for_status()
@@ -737,7 +757,7 @@ try:
     # ═══════════════════════════════════════════════════════════════════════════
     print("📥 STEP 1: Load Groomers Data")
 
-    workbook_groomers = gc.open("Groomers")
+    workbook_groomers = safe_open_sheet("Groomers")
     worksheet_groomers = workbook_groomers.worksheet("Groomers")
     data_groomers = worksheet_groomers.get_all_values()
 
@@ -760,7 +780,7 @@ try:
     print("\n📥 STEP 2: Load Master Data")
 
     try:
-        workbook_master = gc.open("DS Full program - All Intake 2026")
+        workbook_master = safe_open_sheet("DS Full program - All Intake 2026")
         worksheet_master = workbook_master.worksheet("Master Data 2023-2026")
         data_master = worksheet_master.get_all_values()
 
@@ -798,7 +818,7 @@ try:
     print("UPLOADING TO GOOGLE SHEETS")
     print("=" * 80)
 
-    sheet = gc.open_by_key(OUTPUT_SHEET_ID)
+    sheet = safe_open_by_key(OUTPUT_SHEET_ID)
 
     print(f"\n☁️  Uploading {STUDENT_LEVEL_WORKSHEET}...")
     try:
@@ -824,7 +844,6 @@ try:
     # CONFIG
     # =====================================================================
 
-    METABASE_HOST = "https://metabase-lierhfgoeiwhr.newtonschool.co"
     SESSION_COMPLETION_CARD_ID = 11794  # "user-level-lecture-level-attendance-session-completion-rate"
 
     OUTPUT_SHEET_ID = "1z72t5HaE3ombCHo6kbpM3bqhnuTEBNR6L8jncdQZ7Y8"  # <-- update if this should target a different sheet
@@ -899,7 +918,7 @@ try:
 
         res = requests.post(
             f"{METABASE_HOST}/api/card/{metabase_card_id}/query/json",
-            headers={"Content-Type": "application/json", "X-Metabase-Session": token},
+            headers=METABASE_HEADERS,
             timeout=3600,
         )
         res.raise_for_status()
@@ -973,7 +992,7 @@ try:
     # ═══════════════════════════════════════════════════════════════════════════
     print("📥 STEP 1: Load Groomers Data")
 
-    workbook_groomers = gc.open("Groomers")
+    workbook_groomers = safe_open_sheet("Groomers")
     worksheet_groomers = workbook_groomers.worksheet("Groomers")
     data_groomers = worksheet_groomers.get_all_values()
 
@@ -996,7 +1015,7 @@ try:
     print("\n📥 STEP 2: Load Master Data")
 
     try:
-        workbook_master = gc.open("DS Full program - All Intake 2026")
+        workbook_master = safe_open_sheet("DS Full program - All Intake 2026")
         worksheet_master = workbook_master.worksheet("Master Data 2023-2026")
         data_master = worksheet_master.get_all_values()
 
@@ -1034,7 +1053,7 @@ try:
     print("UPLOADING TO GOOGLE SHEETS")
     print("=" * 80)
 
-    sheet = gc.open_by_key(OUTPUT_SHEET_ID)
+    sheet = safe_open_by_key(OUTPUT_SHEET_ID)
 
     print(f"\n☁️  Uploading {STUDENT_LEVEL_WORKSHEET}...")
     try:
@@ -1060,7 +1079,6 @@ try:
     # CONFIG
     # =====================================================================
 
-    METABASE_HOST = "https://metabase-lierhfgoeiwhr.newtonschool.co"
     TIME_SPENT_CARD_ID = 11636  # "user-level-lecture-level-attendance-time-spent"
 
     OUTPUT_SHEET_ID = "1NJqW814fFvwJsrDkk5uzdg4WDhICTGs2eaMW8iv-uRk"  # <-- update if this should target a different sheet
@@ -1140,7 +1158,7 @@ try:
 
         res = requests.post(
             f"{METABASE_HOST}/api/card/{metabase_card_id}/query/json",
-            headers={"Content-Type": "application/json", "X-Metabase-Session": token},
+            headers=METABASE_HEADERS,
             timeout=3600,
         )
         res.raise_for_status()
@@ -1214,7 +1232,7 @@ try:
     # ═══════════════════════════════════════════════════════════════════════════
     print("📥 STEP 1: Load Groomers Data")
 
-    workbook_groomers = gc.open("Groomers")
+    workbook_groomers = safe_open_sheet("Groomers")
     worksheet_groomers = workbook_groomers.worksheet("Groomers")
     data_groomers = worksheet_groomers.get_all_values()
 
@@ -1237,7 +1255,7 @@ try:
     print("\n📥 STEP 2: Load Master Data")
 
     try:
-        workbook_master = gc.open("DS Full program - All Intake 2026")
+        workbook_master = safe_open_sheet("DS Full program - All Intake 2026")
         worksheet_master = workbook_master.worksheet("Master Data 2023-2026")
         data_master = worksheet_master.get_all_values()
 
@@ -1273,7 +1291,7 @@ try:
     print("UPLOADING TO GOOGLE SHEETS")
     print("=" * 80)
 
-    sheet = gc.open_by_key(OUTPUT_SHEET_ID)
+    sheet = safe_open_by_key(OUTPUT_SHEET_ID)
 
     print(f"\n☁️  Uploading {STUDENT_LEVEL_WORKSHEET}...")
     try:
@@ -1299,7 +1317,6 @@ try:
     # CONFIG
     # =====================================================================
 
-    METABASE_HOST = "https://metabase-lierhfgoeiwhr.newtonschool.co"
     TIME_SPENT_CARD_ID = 11796  # "user-level-lecture-level-attendance-time-spent"
 
     OUTPUT_SHEET_ID = "1z72t5HaE3ombCHo6kbpM3bqhnuTEBNR6L8jncdQZ7Y8"  # <-- update if this should target a different sheet
@@ -1376,7 +1393,7 @@ try:
 
         res = requests.post(
             f"{METABASE_HOST}/api/card/{metabase_card_id}/query/json",
-            headers={"Content-Type": "application/json", "X-Metabase-Session": token},
+            headers=METABASE_HEADERS,
             timeout=3600,
         )
         res.raise_for_status()
@@ -1450,7 +1467,7 @@ try:
     # ═══════════════════════════════════════════════════════════════════════════
     print("📥 STEP 1: Load Groomers Data")
 
-    workbook_groomers = gc.open("Groomers")
+    workbook_groomers = safe_open_sheet("Groomers")
     worksheet_groomers = workbook_groomers.worksheet("Groomers")
     data_groomers = worksheet_groomers.get_all_values()
 
@@ -1473,7 +1490,7 @@ try:
     print("\n📥 STEP 2: Load Master Data")
 
     try:
-        workbook_master = gc.open("DS Full program - All Intake 2026")
+        workbook_master = safe_open_sheet("DS Full program - All Intake 2026")
         worksheet_master = workbook_master.worksheet("Master Data 2023-2026")
         data_master = worksheet_master.get_all_values()
 
@@ -1509,7 +1526,7 @@ try:
     print("UPLOADING TO GOOGLE SHEETS")
     print("=" * 80)
 
-    sheet = gc.open_by_key(OUTPUT_SHEET_ID)
+    sheet = safe_open_by_key(OUTPUT_SHEET_ID)
 
     print(f"\n☁️  Uploading {STUDENT_LEVEL_WORKSHEET}...")
     try:
@@ -1535,7 +1552,6 @@ try:
     # CONFIG
     # =====================================================================
 
-    METABASE_HOST = "https://metabase-lierhfgoeiwhr.newtonschool.co"
     RETENTION_CARD_ID = 11637  # "user-level-lecture-level-attendance-retention"
 
     OUTPUT_SHEET_ID = "1MrxwvmQP45Q2lhrEg6YYzJfI3wnzl-OLVqozkqMirDU"  # <-- update if this should target a different sheet
@@ -1603,7 +1619,7 @@ try:
 
         res = requests.post(
             f"{METABASE_HOST}/api/card/{metabase_card_id}/query/json",
-            headers={"Content-Type": "application/json", "X-Metabase-Session": token},
+            headers=METABASE_HEADERS,
             timeout=3600,
         )
         res.raise_for_status()
@@ -1677,7 +1693,7 @@ try:
     # ═══════════════════════════════════════════════════════════════════════════
     print("📥 STEP 1: Load Groomers Data")
 
-    workbook_groomers = gc.open("Groomers")
+    workbook_groomers = safe_open_sheet("Groomers")
     worksheet_groomers = workbook_groomers.worksheet("Groomers")
     data_groomers = worksheet_groomers.get_all_values()
 
@@ -1700,7 +1716,7 @@ try:
     print("\n📥 STEP 2: Load Master Data")
 
     try:
-        workbook_master = gc.open("DS Full program - All Intake 2026")
+        workbook_master = safe_open_sheet("DS Full program - All Intake 2026")
         worksheet_master = workbook_master.worksheet("Master Data 2023-2026")
         data_master = worksheet_master.get_all_values()
 
@@ -1736,7 +1752,7 @@ try:
     print("UPLOADING TO GOOGLE SHEETS")
     print("=" * 80)
 
-    sheet = gc.open_by_key(OUTPUT_SHEET_ID)
+    sheet = safe_open_by_key(OUTPUT_SHEET_ID)
 
     print(f"\n☁️  Uploading {STUDENT_LEVEL_WORKSHEET}...")
     try:
@@ -1762,7 +1778,6 @@ try:
     # CONFIG
     # =====================================================================
 
-    METABASE_HOST = "https://metabase-lierhfgoeiwhr.newtonschool.co"
     RETENTION_CARD_ID = 11799  # "user-level-lecture-level-attendance-retention"
 
     OUTPUT_SHEET_ID = "1z72t5HaE3ombCHo6kbpM3bqhnuTEBNR6L8jncdQZ7Y8"  # <-- update if this should target a different sheet
@@ -1832,7 +1847,7 @@ try:
 
         res = requests.post(
             f"{METABASE_HOST}/api/card/{metabase_card_id}/query/json",
-            headers={"Content-Type": "application/json", "X-Metabase-Session": token},
+            headers=METABASE_HEADERS,
             timeout=3600,
         )
         res.raise_for_status()
@@ -1906,7 +1921,7 @@ try:
     # ═══════════════════════════════════════════════════════════════════════════
     print("📥 STEP 1: Load Groomers Data")
 
-    workbook_groomers = gc.open("Groomers")
+    workbook_groomers = safe_open_sheet("Groomers")
     worksheet_groomers = workbook_groomers.worksheet("Groomers")
     data_groomers = worksheet_groomers.get_all_values()
 
@@ -1929,12 +1944,12 @@ try:
     print("\n📥 STEP 2: Load Master Data")
 
     try:
-        workbook_master = gc.open("DS Full program - All Intake 2026")
+        workbook_master = safe_open_sheet("DS Full program - All Intake 2026")
         worksheet_master = workbook_master.worksheet("Master Data 2023-2026")
         data_master = worksheet_master.get_all_values()
 
         df_master = pd.DataFrame(data_master[1:], columns=data_master[0])
-        df_master = df_master.rename(columns={"User ID ": "user_id"})
+        df_master = df_master.rename(columns={"UserID": "user_id"})
         df_master["user_id"] = df_master["user_id"].astype(str).str.strip()
         df_master = df_master[~df_master["Persona"].isin(["NF", "#N/A"]) & df_master["Persona"].notna()].copy()
 
@@ -1965,7 +1980,7 @@ try:
     print("UPLOADING TO GOOGLE SHEETS")
     print("=" * 80)
 
-    sheet = gc.open_by_key(OUTPUT_SHEET_ID)
+    sheet = safe_open_by_key(OUTPUT_SHEET_ID)
 
     print(f"\n☁️  Uploading {STUDENT_LEVEL_WORKSHEET}...")
     try:
@@ -1993,7 +2008,6 @@ try:
     # CONFIG
     # =====================================================================
 
-    METABASE_HOST = "https://metabase-lierhfgoeiwhr.newtonschool.co"
     RATING_CARD_ID = 11642  # "instructor-rating-student-level-lecture-level"
 
     OUTPUT_SHEET_ID = "1MrxwvmQP45Q2lhrEg6YYzJfI3wnzl-OLVqozkqMirDU"  # <-- update if this should target a different sheet
@@ -2074,7 +2088,7 @@ try:
 
         res = requests.post(
             f"{METABASE_HOST}/api/card/{metabase_card_id}/query/json",
-            headers={"Content-Type": "application/json", "X-Metabase-Session": token},
+            headers=METABASE_HEADERS,
             timeout=3600,
         )
         res.raise_for_status()
@@ -2145,7 +2159,7 @@ try:
     # ═══════════════════════════════════════════════════════════════════════════
     print("📥 STEP 1: Load Groomers Data")
 
-    workbook_groomers = gc.open("Groomers")
+    workbook_groomers = safe_open_sheet("Groomers")
     worksheet_groomers = workbook_groomers.worksheet("Groomers")
     data_groomers = worksheet_groomers.get_all_values()
 
@@ -2168,7 +2182,7 @@ try:
     print("\n📥 STEP 2: Load Master Data")
 
     try:
-        workbook_master = gc.open("DS Full program - All Intake 2026")
+        workbook_master = safe_open_sheet("DS Full program - All Intake 2026")
         worksheet_master = workbook_master.worksheet("Master Data 2023-2026")
         data_master = worksheet_master.get_all_values()
 
@@ -2205,7 +2219,7 @@ try:
     print("UPLOADING TO GOOGLE SHEETS")
     print("=" * 80)
 
-    sheet = gc.open_by_key(OUTPUT_SHEET_ID)
+    sheet = safe_open_by_key(OUTPUT_SHEET_ID)
 
     print(f"\n☁️  Uploading {STUDENT_LEVEL_WORKSHEET}...")
     try:
@@ -2233,7 +2247,6 @@ try:
     # CONFIG
     # =====================================================================
 
-    METABASE_HOST = "https://metabase-lierhfgoeiwhr.newtonschool.co"
     RATING_CARD_ID = 11802  # "instructor-rating-student-level-lecture-level"
 
     OUTPUT_SHEET_ID = "1z72t5HaE3ombCHo6kbpM3bqhnuTEBNR6L8jncdQZ7Y8"  # <-- update if this should target a different sheet
@@ -2314,7 +2327,7 @@ try:
 
         res = requests.post(
             f"{METABASE_HOST}/api/card/{metabase_card_id}/query/json",
-            headers={"Content-Type": "application/json", "X-Metabase-Session": token},
+            headers=METABASE_HEADERS,
             timeout=3600,
         )
         res.raise_for_status()
@@ -2385,7 +2398,7 @@ try:
     # ═══════════════════════════════════════════════════════════════════════════
     print("📥 STEP 1: Load Groomers Data")
 
-    workbook_groomers = gc.open("Groomers")
+    workbook_groomers = safe_open_sheet("Groomers")
     worksheet_groomers = workbook_groomers.worksheet("Groomers")
     data_groomers = worksheet_groomers.get_all_values()
 
@@ -2408,7 +2421,7 @@ try:
     print("\n📥 STEP 2: Load Master Data")
 
     try:
-        workbook_master = gc.open("DS Full program - All Intake 2026")
+        workbook_master = safe_open_sheet("DS Full program - All Intake 2026")
         worksheet_master = workbook_master.worksheet("Master Data 2023-2026")
         data_master = worksheet_master.get_all_values()
 
@@ -2445,7 +2458,7 @@ try:
     print("UPLOADING TO GOOGLE SHEETS")
     print("=" * 80)
 
-    sheet = gc.open_by_key(OUTPUT_SHEET_ID)
+    sheet = safe_open_by_key(OUTPUT_SHEET_ID)
 
     print(f"\n☁️  Uploading {STUDENT_LEVEL_WORKSHEET}...")
     try:
@@ -2466,19 +2479,3 @@ except Exception as e:
 mins, secs = divmod(time.time() - start_time, 60)
 print(f"\n🎯 Attendance X Persona Views Pipeline completed successfully in {int(mins)}m {int(secs)}s")
 sys.exit(0)
-# This is a sample Python script.
-
-# Press ⌃R to execute it or replace it with your code.
-# Press Double ⇧ to search everywhere for classes, files, tool windows, actions, and settings.
-
-
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press ⌘F8 to toggle the breakpoint.
-
-
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
-
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
