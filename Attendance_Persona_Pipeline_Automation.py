@@ -29,16 +29,12 @@ from google.oauth2.service_account import Credentials
 start_time = time.time()
 
 # -------------------- ENV & AUTH --------------------
-sec = os.getenv("ASHRITHA_SECRET_KEY")
-User_name = os.getenv("METABASE_USERNAME") or os.getenv("USERNAME")
+METABASE_API_KEY = os.getenv("METABASE_API_KEY")
 service_account_json = os.getenv("SERVICE_ACCOUNT_JSON")
-MB_URL = os.getenv("METABASE_URL")
 
 missing = [n for n, v in [
-    ("ASHRITHA_SECRET_KEY", sec),
-    ("METABASE_USERNAME/USERNAME", User_name),
+    ("METABASE_API_KEY", METABASE_API_KEY),
     ("SERVICE_ACCOUNT_JSON", service_account_json),
-    ("METABASE_URL", MB_URL),
 ] if not v]
 if missing:
     raise ValueError(f"❌ Missing environment variables: {', '.join(missing)}")
