@@ -17,6 +17,26 @@ Actions execution:
     fails with the exact service-account email to add, instead of a bare
     SpreadsheetNotFound traceback.
   - Any uncaught exception exits non-zero so the GitHub Actions run goes red.
+
+FIX (this version) — new batches were being collapsed to near-zero rows:
+  Every load_and_merge_*() used to filter with
+  `df_raw[df_raw["user_id"].isin(approved_ids)]` BEFORE merging against the
+  "Groomers" sheet, where approved_ids only contains students someone has
+  already manually added to that tracker. A brand-new batch's students
+  aren't in Groomers yet (nobody's had time to add them), so almost the
+  whole batch was silently dropped before ever reaching the output sheet —
+  this is exactly what happened to the Sept 2026 Spreadsheets batches on
+  the "Batch Wise COC Attendance - LIVE" report: Metabase card 11634
+  already had 192 enrolled students with 154 of them GEM/Non-GEM labeled,
+  but only 7 survived the old filter, all coincidentally unlabeled, making
+  the batch look both tiny and un-classified.
+
+  "Not yet tracked in Groomers" is not the same as "excluded" — only
+  students EXPLICITLY flagged Refund Requested / DPD-Foreclosed / Unavailable
+  should be dropped. merge_groomers_keep_unlisted() below implements that
+  once, and every cell now calls it instead of duplicating the old
+  filter-then-merge pattern (which also means fixing this bug required
+  changing one function instead of ten near-identical copies of it).
 """
 
 import os
@@ -118,6 +138,55 @@ def safe_open_by_key(key):
             f"❌ Could not open Google Sheet with key '{key}'. Share it with "
             f"this service account as Editor: {service_info.get('client_email')}"
         )
+
+
+# -------------------- SHARED: Groomers merge/exclude (used by every cell) --------------------
+# Enrolled Status values that mean "actively exclude this student" -- NOT the
+# same as "no Groomers row found", which now means "keep, pending tracking".
+EXCLUDED_ENROLLED_STATUSES = {"Refund Requested", "DPD/Foreclosed"}
+
+
+def merge_groomers_keep_unlisted(df_raw, df_groomers):
+    """
+    Left-merge df_raw against the FULL Groomers roster (not a pre-filtered
+    subset), then exclude only rows EXPLICITLY flagged Refund Requested,
+    DPD/Foreclosed, or Unavailable.
+
+    This replaces the old pattern used in every cell:
+        approved_ids = df_groomers_clean["user_id"].unique().tolist()
+        df_filtered = df_raw[df_raw["user_id"].isin(approved_ids)]
+        df_merged = df_filtered.merge(df_groomers_clean[...], on="user_id", how="left")
+
+    That pattern silently dropped any student not yet present in the
+    Groomers sheet -- which is every student in a brand-new batch, until
+    someone manually adds them -- collapsing new batches down to a handful
+    of rows in every downstream report. This is exactly what was happening
+    to the Sept 2026 Spreadsheets batches on the "Batch Wise COC Attendance
+    - LIVE" report: ~192 students were enrolled and 154 of them already had
+    a GEM/Non-GEM label in Metabase (card 11634's gem_label column), but
+    only 7 survived the old filter -- because only 7 had already been typed
+    into the Groomers sheet -- and all 7 happened to be unlabeled, so the
+    batch looked both tiny AND un-classified.
+
+    "Not yet tracked in Groomers" is now treated as "keep, pending
+    classification" instead of "exclude". Only students EXPLICITLY flagged
+    in the tracker are dropped.
+    """
+    merged = df_raw.merge(
+        df_groomers[["user_id", "Enrolled Status", "Phase"]],
+        on="user_id",
+        how="left",
+    )
+
+    not_yet_tracked = merged["Enrolled Status"].isna()
+    if not_yet_tracked.any():
+        print(f"   ℹ️ {not_yet_tracked.sum()} row(s) have no Groomers entry yet "
+              f"(new/untracked student) — kept, not dropped")
+
+    return merged[
+        ~merged["Enrolled Status"].isin(EXCLUDED_ENROLLED_STATUSES)
+        & (merged["Phase"] != "Unavailable")
+    ].copy()
 
 
 print("🔎 ENV CHECK")
@@ -254,15 +323,9 @@ try:
         df_raw = df_raw[df_raw["batch_name"].str.contains(module_pattern, case=False, na=False)].copy()
         print(f"  ✓ {len(df_raw)} rows after filtering to batches matching: {MODULE_FILTER}")
 
-        # Filter by approved students
-        df_filtered = df_raw[df_raw["user_id"].isin(approved_ids)].copy()
-
-        # Merge with Groomers
-        df_merged = df_filtered.merge(
-            df_groomers_clean[["user_id", "Enrolled Status", "Phase"]],
-            on="user_id",
-            how="left",
-        )
+        # Merge with Groomers (keeps students not yet added to the tracker --
+        # see merge_groomers_keep_unlisted() docstring at the top of this file)
+        df_merged = merge_groomers_keep_unlisted(df_raw, df_groomers)
 
         # Merge with Master Data (dynamically)
         if master_data_available:
@@ -298,15 +361,13 @@ try:
     df_groomers = pd.DataFrame(data_groomers[1:], columns=data_groomers[0])
     df_groomers = df_groomers.rename(columns={"UserID": "user_id"})
     df_groomers["user_id"] = df_groomers["user_id"].astype(str).str.strip()
-
-    df_groomers_clean = df_groomers[
-        (df_groomers["Enrolled Status"] != "Refund Requested")
-        & (df_groomers["Phase"] != "Unavailable")
-        & (df_groomers["Enrolled Status"] != "DPD/Foreclosed")
-    ].copy()
-
-    approved_ids = df_groomers_clean["user_id"].unique().tolist()
-    print(f"✓ Approved Students: {len(approved_ids)}")
+    print(f"✓ Groomers tracker has {len(df_groomers)} student rows")
+    # NOTE: exclusion (Refund Requested / DPD-Foreclosed / Unavailable) now
+    # happens per-cell, via merge_groomers_keep_unlisted(), AFTER merging
+    # against the full Metabase roster. A student who isn't in this sheet at
+    # all (e.g. a brand-new batch not yet manually added) is no longer
+    # treated as excluded -- only students EXPLICITLY flagged here are
+    # dropped. See the module docstring for why this changed.
 
     # ═══════════════════════════════════════════════════════════════════════════
     # STEP 2: Load Master Data (Once)
@@ -339,11 +400,14 @@ try:
     df_lecture_attendance = load_and_merge_lecture_attendance_data(
         LECTURE_ATTENDANCE_CARD_ID, "Lecture-Level Attendance"
     )
-    print(f"✓ Merged lecture-level attendance for {len(df_lecture_attendance)} approved student-lecture rows")
+    print(f"✓ Merged lecture-level attendance for {len(df_lecture_attendance)} student-lecture rows")
 
     if len(df_lecture_attendance) > 0:
         print(f"  Batches included: {sorted(df_lecture_attendance['batch_name'].unique())}")
         print(f"  Modules found: {sorted(df_lecture_attendance['Module'].unique())}")
+        if "gem_label" in df_lecture_attendance.columns:
+            print(f"  GEM/Non-GEM breakdown: "
+                  f"{df_lecture_attendance['gem_label'].fillna('(unclassified)').value_counts().to_dict()}")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # STEP 4: Upload to Google Sheets (Student Level)
@@ -482,15 +546,9 @@ try:
         df_raw = df_raw[df_raw["batch_name"].str.contains(module_pattern, case=False, na=False)].copy()
         print(f"  ✓ {len(df_raw)} rows after filtering to batches matching: {MODULE_FILTER}")
 
-        # Filter by approved students
-        df_filtered = df_raw[df_raw["user_id"].isin(approved_ids)].copy()
-
-        # Merge with Groomers
-        df_merged = df_filtered.merge(
-            df_groomers_clean[["user_id", "Enrolled Status", "Phase"]],
-            on="user_id",
-            how="left",
-        )
+        # Merge with Groomers (keeps students not yet added to the tracker --
+        # see merge_groomers_keep_unlisted() docstring at the top of this file)
+        df_merged = merge_groomers_keep_unlisted(df_raw, df_groomers)
 
         # Merge with Master Data (dynamically)
         if master_data_available:
@@ -526,15 +584,7 @@ try:
     df_groomers = pd.DataFrame(data_groomers[1:], columns=data_groomers[0])
     df_groomers = df_groomers.rename(columns={"UserID": "user_id"})
     df_groomers["user_id"] = df_groomers["user_id"].astype(str).str.strip()
-
-    df_groomers_clean = df_groomers[
-        (df_groomers["Enrolled Status"] != "Refund Requested")
-        & (df_groomers["Phase"] != "Unavailable")
-        & (df_groomers["Enrolled Status"] != "DPD/Foreclosed")
-    ].copy()
-
-    approved_ids = df_groomers_clean["user_id"].unique().tolist()
-    print(f"✓ Approved Students: {len(approved_ids)}")
+    print(f"✓ Groomers tracker has {len(df_groomers)} student rows")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # STEP 2: Load Master Data (Once)
@@ -567,7 +617,7 @@ try:
     df_lecture_attendance = load_and_merge_lecture_attendance_data(
         LECTURE_ATTENDANCE_CARD_ID, "Lecture-Level Attendance"
     )
-    print(f"✓ Merged lecture-level attendance for {len(df_lecture_attendance)} approved student-lecture rows")
+    print(f"✓ Merged lecture-level attendance for {len(df_lecture_attendance)} student-lecture rows")
 
     if len(df_lecture_attendance) > 0:
         print(f"  Batches included: {sorted(df_lecture_attendance['batch_name'].unique())}")
@@ -720,15 +770,9 @@ try:
             df_raw = df_raw[df_raw["batch_name"].str.contains(module_pattern, case=False, na=False)].copy()
             print(f"  ✓ {len(df_raw)} rows after filtering to batches matching: {MODULE_FILTER}")
 
-        # Filter by approved students
-        df_filtered = df_raw[df_raw["user_id"].isin(approved_ids)].copy()
-
-        # Merge with Groomers
-        df_merged = df_filtered.merge(
-            df_groomers_clean[["user_id", "Enrolled Status", "Phase"]],
-            on="user_id",
-            how="left",
-        )
+        # Merge with Groomers (keeps students not yet added to the tracker --
+        # see merge_groomers_keep_unlisted() docstring at the top of this file)
+        df_merged = merge_groomers_keep_unlisted(df_raw, df_groomers)
 
         # Merge with Master Data (dynamically)
         if master_data_available:
@@ -764,15 +808,7 @@ try:
     df_groomers = pd.DataFrame(data_groomers[1:], columns=data_groomers[0])
     df_groomers = df_groomers.rename(columns={"UserID": "user_id"})
     df_groomers["user_id"] = df_groomers["user_id"].astype(str).str.strip()
-
-    df_groomers_clean = df_groomers[
-        (df_groomers["Enrolled Status"] != "Refund Requested")
-        & (df_groomers["Phase"] != "Unavailable")
-        & (df_groomers["Enrolled Status"] != "DPD/Foreclosed")
-    ].copy()
-
-    approved_ids = df_groomers_clean["user_id"].unique().tolist()
-    print(f"✓ Approved Students: {len(approved_ids)}")
+    print(f"✓ Groomers tracker has {len(df_groomers)} student rows")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # STEP 2: Load Master Data (Once)
@@ -805,7 +841,7 @@ try:
     df_session_completion = load_and_merge_session_completion_data(
         SESSION_COMPLETION_CARD_ID, "Session Completion Rate"
     )
-    print(f"✓ Merged session completion data for {len(df_session_completion)} approved student-lecture rows")
+    print(f"✓ Merged session completion data for {len(df_session_completion)} student-lecture rows")
 
     if len(df_session_completion) > 0:
         print(f"  Batches included: {sorted(df_session_completion['batch_name'].unique())}")
@@ -955,15 +991,9 @@ try:
             df_raw = df_raw[df_raw["batch_name"].str.contains(module_pattern, case=False, na=False)].copy()
             print(f"  ✓ {len(df_raw)} rows after filtering to batches matching: {MODULE_FILTER}")
 
-        # Filter by approved students
-        df_filtered = df_raw[df_raw["user_id"].isin(approved_ids)].copy()
-
-        # Merge with Groomers
-        df_merged = df_filtered.merge(
-            df_groomers_clean[["user_id", "Enrolled Status", "Phase"]],
-            on="user_id",
-            how="left",
-        )
+        # Merge with Groomers (keeps students not yet added to the tracker --
+        # see merge_groomers_keep_unlisted() docstring at the top of this file)
+        df_merged = merge_groomers_keep_unlisted(df_raw, df_groomers)
 
         # Merge with Master Data (dynamically)
         if master_data_available:
@@ -999,15 +1029,7 @@ try:
     df_groomers = pd.DataFrame(data_groomers[1:], columns=data_groomers[0])
     df_groomers = df_groomers.rename(columns={"UserID": "user_id"})
     df_groomers["user_id"] = df_groomers["user_id"].astype(str).str.strip()
-
-    df_groomers_clean = df_groomers[
-        (df_groomers["Enrolled Status"] != "Refund Requested")
-        & (df_groomers["Phase"] != "Unavailable")
-        & (df_groomers["Enrolled Status"] != "DPD/Foreclosed")
-    ].copy()
-
-    approved_ids = df_groomers_clean["user_id"].unique().tolist()
-    print(f"✓ Approved Students: {len(approved_ids)}")
+    print(f"✓ Groomers tracker has {len(df_groomers)} student rows")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # STEP 2: Load Master Data (Once)
@@ -1040,7 +1062,7 @@ try:
     df_session_completion = load_and_merge_session_completion_data(
         SESSION_COMPLETION_CARD_ID, "Session Completion Rate"
     )
-    print(f"✓ Merged session completion data for {len(df_session_completion)} approved student-lecture rows")
+    print(f"✓ Merged session completion data for {len(df_session_completion)} student-lecture rows")
 
     if len(df_session_completion) > 0:
         print(f"  Batches included: {sorted(df_session_completion['batch_name'].unique())}")
@@ -1195,15 +1217,9 @@ try:
             df_raw = df_raw[df_raw["batch_name"].str.contains(module_pattern, case=False, na=False)].copy()
             print(f"  ✓ {len(df_raw)} rows after filtering to batches matching: {MODULE_FILTER}")
 
-        # Filter by approved students
-        df_filtered = df_raw[df_raw["user_id"].isin(approved_ids)].copy()
-
-        # Merge with Groomers
-        df_merged = df_filtered.merge(
-            df_groomers_clean[["user_id", "Enrolled Status", "Phase"]],
-            on="user_id",
-            how="left",
-        )
+        # Merge with Groomers (keeps students not yet added to the tracker --
+        # see merge_groomers_keep_unlisted() docstring at the top of this file)
+        df_merged = merge_groomers_keep_unlisted(df_raw, df_groomers)
 
         # Merge with Master Data (dynamically)
         if master_data_available:
@@ -1239,15 +1255,7 @@ try:
     df_groomers = pd.DataFrame(data_groomers[1:], columns=data_groomers[0])
     df_groomers = df_groomers.rename(columns={"UserID": "user_id"})
     df_groomers["user_id"] = df_groomers["user_id"].astype(str).str.strip()
-
-    df_groomers_clean = df_groomers[
-        (df_groomers["Enrolled Status"] != "Refund Requested")
-        & (df_groomers["Phase"] != "Unavailable")
-        & (df_groomers["Enrolled Status"] != "DPD/Foreclosed")
-    ].copy()
-
-    approved_ids = df_groomers_clean["user_id"].unique().tolist()
-    print(f"✓ Approved Students: {len(approved_ids)}")
+    print(f"✓ Groomers tracker has {len(df_groomers)} student rows")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # STEP 2: Load Master Data (Once)
@@ -1278,7 +1286,7 @@ try:
     print("=" * 80)
 
     df_time_spent = load_and_merge_time_spent_data(TIME_SPENT_CARD_ID, "Time Spent in Session")
-    print(f"✓ Merged time-spent data for {len(df_time_spent)} approved student-lecture rows")
+    print(f"✓ Merged time-spent data for {len(df_time_spent)} student-lecture rows")
 
     if len(df_time_spent) > 0:
         print(f"  Batches included: {sorted(df_time_spent['batch_name'].unique())}")
@@ -1430,15 +1438,9 @@ try:
             df_raw = df_raw[df_raw["batch_name"].str.contains(module_pattern, case=False, na=False)].copy()
             print(f"  ✓ {len(df_raw)} rows after filtering to batches matching: {MODULE_FILTER}")
 
-        # Filter by approved students
-        df_filtered = df_raw[df_raw["user_id"].isin(approved_ids)].copy()
-
-        # Merge with Groomers
-        df_merged = df_filtered.merge(
-            df_groomers_clean[["user_id", "Enrolled Status", "Phase"]],
-            on="user_id",
-            how="left",
-        )
+        # Merge with Groomers (keeps students not yet added to the tracker --
+        # see merge_groomers_keep_unlisted() docstring at the top of this file)
+        df_merged = merge_groomers_keep_unlisted(df_raw, df_groomers)
 
         # Merge with Master Data (dynamically)
         if master_data_available:
@@ -1474,15 +1476,7 @@ try:
     df_groomers = pd.DataFrame(data_groomers[1:], columns=data_groomers[0])
     df_groomers = df_groomers.rename(columns={"UserID": "user_id"})
     df_groomers["user_id"] = df_groomers["user_id"].astype(str).str.strip()
-
-    df_groomers_clean = df_groomers[
-        (df_groomers["Enrolled Status"] != "Refund Requested")
-        & (df_groomers["Phase"] != "Unavailable")
-        & (df_groomers["Enrolled Status"] != "DPD/Foreclosed")
-    ].copy()
-
-    approved_ids = df_groomers_clean["user_id"].unique().tolist()
-    print(f"✓ Approved Students: {len(approved_ids)}")
+    print(f"✓ Groomers tracker has {len(df_groomers)} student rows")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # STEP 2: Load Master Data (Once)
@@ -1513,7 +1507,7 @@ try:
     print("=" * 80)
 
     df_time_spent = load_and_merge_time_spent_data(TIME_SPENT_CARD_ID, "Time Spent in Session")
-    print(f"✓ Merged time-spent data for {len(df_time_spent)} approved student-lecture rows")
+    print(f"✓ Merged time-spent data for {len(df_time_spent)} student-lecture rows")
 
     if len(df_time_spent) > 0:
         print(f"  Batches included: {sorted(df_time_spent['batch_name'].unique())}")
@@ -1656,15 +1650,9 @@ try:
             df_raw = df_raw[df_raw["batch_name"].str.contains(module_pattern, case=False, na=False)].copy()
             print(f"  ✓ {len(df_raw)} rows after filtering to batches matching: {MODULE_FILTER}")
 
-        # Filter by approved students
-        df_filtered = df_raw[df_raw["user_id"].isin(approved_ids)].copy()
-
-        # Merge with Groomers
-        df_merged = df_filtered.merge(
-            df_groomers_clean[["user_id", "Enrolled Status", "Phase"]],
-            on="user_id",
-            how="left",
-        )
+        # Merge with Groomers (keeps students not yet added to the tracker --
+        # see merge_groomers_keep_unlisted() docstring at the top of this file)
+        df_merged = merge_groomers_keep_unlisted(df_raw, df_groomers)
 
         # Merge with Master Data (dynamically)
         if master_data_available:
@@ -1700,15 +1688,7 @@ try:
     df_groomers = pd.DataFrame(data_groomers[1:], columns=data_groomers[0])
     df_groomers = df_groomers.rename(columns={"UserID": "user_id"})
     df_groomers["user_id"] = df_groomers["user_id"].astype(str).str.strip()
-
-    df_groomers_clean = df_groomers[
-        (df_groomers["Enrolled Status"] != "Refund Requested")
-        & (df_groomers["Phase"] != "Unavailable")
-        & (df_groomers["Enrolled Status"] != "DPD/Foreclosed")
-    ].copy()
-
-    approved_ids = df_groomers_clean["user_id"].unique().tolist()
-    print(f"✓ Approved Students: {len(approved_ids)}")
+    print(f"✓ Groomers tracker has {len(df_groomers)} student rows")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # STEP 2: Load Master Data (Once)
@@ -1739,7 +1719,7 @@ try:
     print("=" * 80)
 
     df_retention = load_and_merge_retention_data(RETENTION_CARD_ID, "Cumulative Cohort Retention")
-    print(f"✓ Merged retention data for {len(df_retention)} approved student-lecture rows")
+    print(f"✓ Merged retention data for {len(df_retention)} student-lecture rows")
 
     if len(df_retention) > 0:
         print(f"  Batches included: {sorted(df_retention['batch_name'].unique())}")
@@ -1884,15 +1864,9 @@ try:
             df_raw = df_raw[df_raw["batch_name"].str.contains(module_pattern, case=False, na=False)].copy()
             print(f"  ✓ {len(df_raw)} rows after filtering to batches matching: {MODULE_FILTER}")
 
-        # Filter by approved students
-        df_filtered = df_raw[df_raw["user_id"].isin(approved_ids)].copy()
-
-        # Merge with Groomers
-        df_merged = df_filtered.merge(
-            df_groomers_clean[["user_id", "Enrolled Status", "Phase"]],
-            on="user_id",
-            how="left",
-        )
+        # Merge with Groomers (keeps students not yet added to the tracker --
+        # see merge_groomers_keep_unlisted() docstring at the top of this file)
+        df_merged = merge_groomers_keep_unlisted(df_raw, df_groomers)
 
         # Merge with Master Data (dynamically)
         if master_data_available:
@@ -1928,15 +1902,7 @@ try:
     df_groomers = pd.DataFrame(data_groomers[1:], columns=data_groomers[0])
     df_groomers = df_groomers.rename(columns={"UserID": "user_id"})
     df_groomers["user_id"] = df_groomers["user_id"].astype(str).str.strip()
-
-    df_groomers_clean = df_groomers[
-        (df_groomers["Enrolled Status"] != "Refund Requested")
-        & (df_groomers["Phase"] != "Unavailable")
-        & (df_groomers["Enrolled Status"] != "DPD/Foreclosed")
-    ].copy()
-
-    approved_ids = df_groomers_clean["user_id"].unique().tolist()
-    print(f"✓ Approved Students: {len(approved_ids)}")
+    print(f"✓ Groomers tracker has {len(df_groomers)} student rows")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # STEP 2: Load Master Data (Once)
@@ -1967,7 +1933,7 @@ try:
     print("=" * 80)
 
     df_retention = load_and_merge_retention_data(RETENTION_CARD_ID, "Cumulative Cohort Retention")
-    print(f"✓ Merged retention data for {len(df_retention)} approved student-lecture rows")
+    print(f"✓ Merged retention data for {len(df_retention)} student-lecture rows")
 
     if len(df_retention) > 0:
         print(f"  Batches included: {sorted(df_retention['batch_name'].unique())}")
@@ -2122,15 +2088,9 @@ try:
             df_raw = df_raw[df_raw["batch_name"].str.contains(pattern, case=False, na=False)].copy()
             print(f"  ✓ {len(df_raw)} rows after filtering to batches matching: {MODULE_FILTER}")
 
-        # Filter by approved students
-        df_filtered = df_raw[df_raw["user_id"].isin(approved_ids)].copy()
-
-        # Merge with Groomers
-        df_merged = df_filtered.merge(
-            df_groomers_clean[["user_id", "Enrolled Status", "Phase"]],
-            on="user_id",
-            how="left",
-        )
+        # Merge with Groomers (keeps students not yet added to the tracker --
+        # see merge_groomers_keep_unlisted() docstring at the top of this file)
+        df_merged = merge_groomers_keep_unlisted(df_raw, df_groomers)
 
         # Merge with Master Data (dynamically)
         if master_data_available:
@@ -2166,15 +2126,7 @@ try:
     df_groomers = pd.DataFrame(data_groomers[1:], columns=data_groomers[0])
     df_groomers = df_groomers.rename(columns={"UserID": "user_id"})
     df_groomers["user_id"] = df_groomers["user_id"].astype(str).str.strip()
-
-    df_groomers_clean = df_groomers[
-        (df_groomers["Enrolled Status"] != "Refund Requested")
-        & (df_groomers["Phase"] != "Unavailable")
-        & (df_groomers["Enrolled Status"] != "DPD/Foreclosed")
-    ].copy()
-
-    approved_ids = df_groomers_clean["user_id"].unique().tolist()
-    print(f"✓ Approved Students: {len(approved_ids)}")
+    print(f"✓ Groomers tracker has {len(df_groomers)} student rows")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # STEP 2: Load Master Data (Once)
@@ -2206,7 +2158,7 @@ try:
 
     df_rating = load_and_merge_rating_data(RATING_CARD_ID, "Lecture Rating")
     df_rating = add_class_number(df_rating)
-    print(f"✓ Merged rating data + class_number for {len(df_rating)} approved student-lecture rows")
+    print(f"✓ Merged rating data + class_number for {len(df_rating)} student-lecture rows")
 
     if len(df_rating) > 0:
         print(f"  Batches included: {sorted(df_rating['batch_name'].unique())}")
@@ -2361,15 +2313,9 @@ try:
             df_raw = df_raw[df_raw["batch_name"].str.contains(pattern, case=False, na=False)].copy()
             print(f"  ✓ {len(df_raw)} rows after filtering to batches matching: {MODULE_FILTER}")
 
-        # Filter by approved students
-        df_filtered = df_raw[df_raw["user_id"].isin(approved_ids)].copy()
-
-        # Merge with Groomers
-        df_merged = df_filtered.merge(
-            df_groomers_clean[["user_id", "Enrolled Status", "Phase"]],
-            on="user_id",
-            how="left",
-        )
+        # Merge with Groomers (keeps students not yet added to the tracker --
+        # see merge_groomers_keep_unlisted() docstring at the top of this file)
+        df_merged = merge_groomers_keep_unlisted(df_raw, df_groomers)
 
         # Merge with Master Data (dynamically)
         if master_data_available:
@@ -2405,15 +2351,7 @@ try:
     df_groomers = pd.DataFrame(data_groomers[1:], columns=data_groomers[0])
     df_groomers = df_groomers.rename(columns={"UserID": "user_id"})
     df_groomers["user_id"] = df_groomers["user_id"].astype(str).str.strip()
-
-    df_groomers_clean = df_groomers[
-        (df_groomers["Enrolled Status"] != "Refund Requested")
-        & (df_groomers["Phase"] != "Unavailable")
-        & (df_groomers["Enrolled Status"] != "DPD/Foreclosed")
-    ].copy()
-
-    approved_ids = df_groomers_clean["user_id"].unique().tolist()
-    print(f"✓ Approved Students: {len(approved_ids)}")
+    print(f"✓ Groomers tracker has {len(df_groomers)} student rows")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # STEP 2: Load Master Data (Once)
@@ -2445,7 +2383,7 @@ try:
 
     df_rating = load_and_merge_rating_data(RATING_CARD_ID, "Lecture Rating")
     df_rating = add_class_number(df_rating)
-    print(f"✓ Merged rating data + class_number for {len(df_rating)} approved student-lecture rows")
+    print(f"✓ Merged rating data + class_number for {len(df_rating)} student-lecture rows")
 
     if len(df_rating) > 0:
         print(f"  Batches included: {sorted(df_rating['batch_name'].unique())}")
