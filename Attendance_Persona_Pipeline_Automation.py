@@ -39,6 +39,7 @@ FIX (this version) — new batches were being collapsed to near-zero rows:
   changing one function instead of ten near-identical copies of it).
 """
 
+import re
 import os
 import sys
 import json
@@ -183,10 +184,42 @@ def merge_groomers_keep_unlisted(df_raw, df_groomers):
         print(f"   ℹ️ {not_yet_tracked.sum()} row(s) have no Groomers entry yet "
               f"(new/untracked student) — kept, not dropped")
 
-    return merged[
-        ~merged["Enrolled Status"].isin(EXCLUDED_ENROLLED_STATUSES)
-        & (merged["Phase"] != "Unavailable")
-    ].copy()
+    # 26 Oct 2026: attendance views must match the portal's section roster,
+    # which counts EVERY student enrolled in the module batch (incl. refund-
+    # requested / DPD / unavailable students who are still enrolled). So no
+    # rows are dropped here any more -- Groomers columns are only attached.
+    return merged.copy()
+
+
+_MONTHS = ("January|February|March|April|May|June|July|August|"
+           "September|October|November|December")
+_SECTION_RE = re.compile(rf"({_MONTHS})\s+(?:([A-Z])\s+)?(\d{{4}})", re.I)
+
+
+def align_to_section(df):
+    """Re-key rows to the module batch (LU section) so Looker matches the portal.
+
+    Looker groups these tables by 'Batch' (from the Master Data sheet) and
+    'gem_label' (from the student's admission batch). Students who moved in
+    from another batch, or whose Master Data row is missing / stale, ended up
+    in the wrong row, so the per-section counts never matched the portal.
+    Here both are derived from batch_name (e.g. "DS SQL - August A 2026"):
+      Batch     -> "August, 2026"   (same text format as Master Data)
+      gem_label -> A = GEM, B = Non-GEM (sections without A/B keep their label)
+    """
+    if df is None or len(df) == 0 or "batch_name" not in df.columns:
+        return df
+    df = df.copy()
+    m = df["batch_name"].astype(str).str.extract(_SECTION_RE)
+    month_year = (m[0].str.capitalize() + ", " + m[2]).where(m[0].notna())
+    df["Batch"] = month_year.fillna(df["Batch"]) if "Batch" in df.columns else month_year
+    section = m[1].str.upper()
+    gem = section.map({"A": "GEM", "B": "Non-GEM"})
+    if "gem_label" in df.columns:
+        df["gem_label"] = gem.fillna(df["gem_label"])
+    else:
+        df["gem_label"] = gem
+    return df
 
 
 print("🔎 ENV CHECK")
@@ -346,7 +379,7 @@ try:
                 how="left",
             )
 
-        return df_merged
+        return align_to_section(df_merged)
 
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -569,7 +602,7 @@ try:
                 how="left",
             )
 
-        return df_merged
+        return align_to_section(df_merged)
 
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -793,7 +826,7 @@ try:
                 how="left",
             )
 
-        return df_merged
+        return align_to_section(df_merged)
 
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1014,7 +1047,7 @@ try:
                 how="left",
             )
 
-        return df_merged
+        return align_to_section(df_merged)
 
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1240,7 +1273,7 @@ try:
                 how="left",
             )
 
-        return df_merged
+        return align_to_section(df_merged)
 
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1461,7 +1494,7 @@ try:
                 how="left",
             )
 
-        return df_merged
+        return align_to_section(df_merged)
 
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1673,7 +1706,7 @@ try:
                 how="left",
             )
 
-        return df_merged
+        return align_to_section(df_merged)
 
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1887,7 +1920,7 @@ try:
                 how="left",
             )
 
-        return df_merged
+        return align_to_section(df_merged)
 
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -2111,7 +2144,7 @@ try:
                 how="left",
             )
 
-        return df_merged
+        return align_to_section(df_merged)
 
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -2336,7 +2369,7 @@ try:
                 how="left",
             )
 
-        return df_merged
+        return align_to_section(df_merged)
 
 
     # ═══════════════════════════════════════════════════════════════════════════
